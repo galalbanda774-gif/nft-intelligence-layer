@@ -1,7 +1,6 @@
 """
 النظام الكامل: اكتشاف مينت مجاني بدأ اليوم على Robinhood Chain،
-التحقق من الضوابط (رسوم الغاز، الكمية)، تنفيذ الشراء تلقائيًا،
-وإرسال إشعار بالنتيجة عبر تيليجرام.
+التحقق من كل الضوابط عبر buyer.py، تنفيذ الشراء، وإرسال إشعار تيليجرام.
 """
 
 import asyncio
@@ -15,7 +14,7 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
-from buyer import get_web3, decide_quantity, buy_mint
+from buyer import get_web3, attempt_purchase
 
 load_dotenv()
 
@@ -37,6 +36,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
+FREE_PRICE_THRESHOLD_USD = 0.01  # أقل من هذا = "مجاني عمليًا"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +48,6 @@ log = logging.getLogger("auto-buyer")
 w3 = get_web3(RPC_URL)
 buy_lock = asyncio.Lock()  # يمنع تضارب nonce لو اكتشف أكتر من مينت بنفس اللحظة
 
-# كاش بسيط لسعر ETH بالدولار (يتحدث كل 5 دقائق بدل استعلام بكل معاملة)
 _eth_price_cache = {"value": None, "ts": 0}
 
 
@@ -66,8 +65,8 @@ def get_eth_price_usd() -> float:
         _eth_price_cache["ts"] = now
         return price
     except Exception as e:
-        log.warning(f"[Price] تعذر جلب سعر ETH: {e}")
-        return _eth_price_cache["value"] or 3000.0  # افتراضي احتياطي
+        log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
+        return _eth_price_cache["value"] or 3000.0
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +105,8 @@ def started_today_local(stage: dict) -> bool:
 
 
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    """يعتبر السعر 'مجاني عمليًا' لو قيمته بالدولار أقل من سنت واحد."""
     price_usd = (price_wei / 1e18) * eth_price_usd
-    return price_usd < 0.01
+    return price_usd < FREE_PRICE_THRESHOLD_USD
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +136,18 @@ async def telegram_sender():
         await asyncio.sleep(1.05)
 
 
-def build_purchase_message(detail: dict, result: dict, quantity: int) -> str:
+REASON_MESSAGES = {
+    "balance_too_low": "الرصيد بالمحفظة منخفض جدًا — توقف النظام عن الشراء",
+    "gas_too_high": "رسوم الغاز التقديرية تجاوزت الحد المسموح",
+    "gas_too_high_precise": "رسوم الغاز الفعلية (بعد التقدير الدقيق) تجاوزت الحد",
+    "no_fee_recipient": "تعذر تحديد عنوان الرسوم من العقد",
+    "simulation_failed": "محاكاة المعاملة فشلت — على الأغلب المينت غير متاح فعليًا",
+    "insufficient_funds_for_total_cost": "الرصيد لا يكفي سعر المينت + الغاز معًا",
+    "tx_error": "خطأ أثناء إرسال المعاملة",
+}
+
+
+def build_result_message(detail: dict, result: dict, quantity: int | None) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     url = detail.get("opensea_url", "")
 
@@ -146,19 +155,20 @@ def build_purchase_message(detail: dict, result: dict, quantity: int) -> str:
         return (
             f"✅ <b>تم الشراء بنجاح!</b>\n\n"
             f"المجموعة: <b>{name}</b>\n"
-            f"الكمية: {quantity}\n"
+            f"الكمية: {result['quantity']}\n"
             f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
             f"معاملة: {result['tx_hash']}\n"
             f"🔗 {url}"
         )
-    else:
-        reason_map = {
-            "gas_too_high": "رسوم الغاز تجاوزت الحد المسموح",
-            "no_fee_recipient": "تعذر تحديد عنوان الرسوم من العقد",
-            "tx_error": f"خطأ بالمعاملة: {result.get('error', '')[:200]}",
-        }
-        reason = reason_map.get(result["reason"], result["reason"])
-        return f"⏭️ <b>تم تجاهل مينت</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
+
+    reason_text = REASON_MESSAGES.get(result["reason"], result["reason"])
+    extra = ""
+    if result["reason"] == "balance_too_low":
+        extra = f"\nالرصيد الحالي: ${result.get('balance_usd', 0):.4f}"
+    elif "gas_too_high" in result["reason"]:
+        extra = f"\nالرسوم المقدّرة: ${result.get('gas_fee_usd', 0):.4f}"
+
+    return f"⏭️ <b>تم تجاهل الشراء</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason_text}{extra}"
 
 
 # ---------------------------------------------------------------------------
@@ -196,25 +206,25 @@ async def evaluate_and_buy(slug: str, notified: set, known_external: set, checki
             log.info(f"⏭️ '{slug}': ليس مينت مجاني ({price_wei} wei) — تم تجاهله.")
             return
 
-        max_per_wallet = stage.get("max_per_wallet")
-        max_per_wallet = int(max_per_wallet) if max_per_wallet is not None else None
-        quantity = decide_quantity(max_per_wallet, remaining)
-
         contract_address = detail.get("contract_address")
         if not contract_address:
             log.warning(f"⏭️ '{slug}': لا يوجد contract_address بالبيانات.")
             known_external.add(slug)
             return
 
-        notified.add(slug)  # نضيفها هنا لمنع محاولات مكررة، حتى لو فشل الشراء
+        max_per_wallet_raw = stage.get("max_per_wallet")
+        max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
+
+        notified.add(slug)  # نمنع محاولات مكررة على نفس المجموعة حتى لو فشل الشراء
 
         async with buy_lock:
             result = await asyncio.to_thread(
-                buy_mint, w3, PRIVATE_KEY, WALLET_ADDRESS,
-                contract_address, price_wei, quantity, eth_price_usd,
+                attempt_purchase,
+                w3, PRIVATE_KEY, WALLET_ADDRESS,
+                contract_address, price_wei, max_per_wallet, remaining, eth_price_usd,
             )
 
-        enqueue_message(build_purchase_message(detail, result, quantity))
+        enqueue_message(build_result_message(detail, result, result.get("quantity")))
         log.info(f"{'✅' if result['success'] else '⏭️'} '{slug}': {result}")
 
     except Exception as e:
