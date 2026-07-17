@@ -24,6 +24,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
 PRIVATE_KEY = os.environ["PRIVATE_KEY"]
 WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
+BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -303,6 +304,12 @@ async def listen_opensea():
 
 
 async def run():
+    if not BOT_ENABLED:
+        log.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان). لن يشتري أي شي.")
+        enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false) — ما رح يشتري لين تفعّله.")
+        await telegram_sender()
+        return
+
     enqueue_message("✅ نظام الشراء التلقائي اشتغل الآن ويراقب Robinhood Chain.")
     await asyncio.gather(listen_opensea(), telegram_sender())
 
