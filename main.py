@@ -1,7 +1,7 @@
 """
-نسخة رصد فقط — تكتشف أول مينت يبدأ اليوم وترسل البيانات الخام الكاملة
-لـ /drops/{slug} عبر تيليجرام، بدون أي شراء فعلي.
-الهدف: التأكد من أسماء الحقول الحقيقية قبل بناء كود الشراء.
+النظام الكامل: اكتشاف مينت مجاني بدأ اليوم على Robinhood Chain،
+التحقق من الضوابط (رسوم الغاز، الكمية)، تنفيذ الشراء تلقائيًا،
+وإرسال إشعار بالنتيجة عبر تيليجرام.
 """
 
 import asyncio
@@ -15,15 +15,21 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
+from buyer import get_web3, decide_quantity, buy_mint
+
 load_dotenv()
 
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
+PRIVATE_KEY = os.environ["PRIVATE_KEY"]
+WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
+RPC_URL = f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 TARGET_CHAIN = "robinhood"
@@ -37,37 +43,36 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("monitor-only")
+log = logging.getLogger("auto-buyer")
 
-send_queue: "asyncio.Queue[str]" = asyncio.Queue()
+w3 = get_web3(RPC_URL)
+buy_lock = asyncio.Lock()  # يمنع تضارب nonce لو اكتشف أكتر من مينت بنفس اللحظة
+
+# كاش بسيط لسعر ETH بالدولار (يتحدث كل 5 دقائق بدل استعلام بكل معاملة)
+_eth_price_cache = {"value": None, "ts": 0}
 
 
-def enqueue_message(text: str):
-    send_queue.put_nowait(text)
+def get_eth_price_usd() -> float:
+    now = time.time()
+    if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 300):
+        return _eth_price_cache["value"]
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+            timeout=8,
+        )
+        price = resp.json()["ethereum"]["usd"]
+        _eth_price_cache["value"] = price
+        _eth_price_cache["ts"] = now
+        return price
+    except Exception as e:
+        log.warning(f"[Price] تعذر جلب سعر ETH: {e}")
+        return _eth_price_cache["value"] or 3000.0  # افتراضي احتياطي
 
 
-async def telegram_sender():
-    while True:
-        text = await send_queue.get()
-        try:
-            # تيليجرام يحدد طول الرسالة، فنقسمها لو طويلة
-            chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
-            for chunk in chunks:
-                await asyncio.to_thread(
-                    requests.post,
-                    f"{TELEGRAM_API}/sendMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": f"<pre>{chunk}</pre>",
-                        "parse_mode": "HTML",
-                    },
-                    timeout=10,
-                )
-                await asyncio.sleep(1.05)
-        except Exception as e:
-            log.error(f"خطأ إرسال تليجرام: {e}")
-        send_queue.task_done()
-
+# ---------------------------------------------------------------------------
+# OpenSea
+# ---------------------------------------------------------------------------
 
 def fetch_drop_detail(slug: str):
     try:
@@ -82,7 +87,7 @@ def fetch_drop_detail(slug: str):
             return False, None
         return None, None
     except Exception as e:
-        log.warning(f"خطأ شبكة: {e}")
+        log.warning(f"[Drops API] خطأ: {e}")
         return None, None
 
 
@@ -93,15 +98,6 @@ def parse_iso(ts: str):
         return None
 
 
-def find_active_stage(stages: list, now):
-    for st in stages:
-        start = parse_iso(st.get("start_time", ""))
-        end = parse_iso(st.get("end_time", ""))
-        if start and end and start <= now <= end:
-            return st
-    return None
-
-
 def started_today_local(stage: dict) -> bool:
     start = parse_iso(stage.get("start_time", ""))
     if not start:
@@ -109,43 +105,138 @@ def started_today_local(stage: dict) -> bool:
     return start.astimezone(LOCAL_TZ).date() == datetime.now(LOCAL_TZ).date()
 
 
-async def inspect_and_report(slug: str, checking: set, already_reported: set):
+def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
+    """يعتبر السعر 'مجاني عمليًا' لو قيمته بالدولار أقل من سنت واحد."""
+    price_usd = (price_wei / 1e18) * eth_price_usd
+    return price_usd < 0.01
+
+
+# ---------------------------------------------------------------------------
+# تيليجرام
+# ---------------------------------------------------------------------------
+
+send_queue: "asyncio.Queue[str]" = asyncio.Queue()
+
+
+def enqueue_message(text: str):
+    send_queue.put_nowait(text)
+
+
+async def telegram_sender():
+    while True:
+        text = await send_queue.get()
+        try:
+            await asyncio.to_thread(
+                requests.post,
+                f"{TELEGRAM_API}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+        except Exception as e:
+            log.error(f"خطأ إرسال تليجرام: {e}")
+        send_queue.task_done()
+        await asyncio.sleep(1.05)
+
+
+def build_purchase_message(detail: dict, result: dict, quantity: int) -> str:
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    url = detail.get("opensea_url", "")
+
+    if result["success"]:
+        return (
+            f"✅ <b>تم الشراء بنجاح!</b>\n\n"
+            f"المجموعة: <b>{name}</b>\n"
+            f"الكمية: {quantity}\n"
+            f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
+            f"معاملة: {result['tx_hash']}\n"
+            f"🔗 {url}"
+        )
+    else:
+        reason_map = {
+            "gas_too_high": "رسوم الغاز تجاوزت الحد المسموح",
+            "no_fee_recipient": "تعذر تحديد عنوان الرسوم من العقد",
+            "tx_error": f"خطأ بالمعاملة: {result.get('error', '')[:200]}",
+        }
+        reason = reason_map.get(result["reason"], result["reason"])
+        return f"⏭️ <b>تم تجاهل مينت</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# منطق التحقق والشراء
+# ---------------------------------------------------------------------------
+
+async def evaluate_and_buy(slug: str, notified: set, known_external: set, checking: set):
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail:
+            known_external.add(slug)
             return
         if not detail.get("is_minting"):
+            known_external.add(slug)
             return
 
-        stages = detail.get("stages") or []
-        now = datetime.now(timezone.utc)
-        stage = find_active_stage(stages, now)
+        stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
+            known_external.add(slug)
+            log.info(f"⏭️ '{slug}': ليس مرحلة اليوم — تم تجاهله.")
             return
 
-        if slug in already_reported:
+        max_supply = int(detail.get("max_supply") or 0)
+        total_supply = int(detail.get("total_supply") or 0)
+        remaining = max_supply - total_supply
+        if remaining <= 0:
+            known_external.add(slug)
             return
-        already_reported.add(slug)
 
-        log.info(f"✅ '{slug}': مينت بدأ اليوم — إرسال البيانات الخام للفحص.")
-        raw = json.dumps(detail, ensure_ascii=False, indent=2)
-        enqueue_message(f"📦 بيانات خام لـ '{slug}':\n\n{raw}")
+        price_wei = int(stage.get("price", "0"))
+        eth_price_usd = get_eth_price_usd()
+
+        if not is_free_or_negligible(price_wei, eth_price_usd):
+            known_external.add(slug)
+            log.info(f"⏭️ '{slug}': ليس مينت مجاني ({price_wei} wei) — تم تجاهله.")
+            return
+
+        max_per_wallet = stage.get("max_per_wallet")
+        max_per_wallet = int(max_per_wallet) if max_per_wallet is not None else None
+        quantity = decide_quantity(max_per_wallet, remaining)
+
+        contract_address = detail.get("contract_address")
+        if not contract_address:
+            log.warning(f"⏭️ '{slug}': لا يوجد contract_address بالبيانات.")
+            known_external.add(slug)
+            return
+
+        notified.add(slug)  # نضيفها هنا لمنع محاولات مكررة، حتى لو فشل الشراء
+
+        async with buy_lock:
+            result = await asyncio.to_thread(
+                buy_mint, w3, PRIVATE_KEY, WALLET_ADDRESS,
+                contract_address, price_wei, quantity, eth_price_usd,
+            )
+
+        enqueue_message(build_purchase_message(detail, result, quantity))
+        log.info(f"{'✅' if result['success'] else '⏭️'} '{slug}': {result}")
 
     except Exception as e:
-        log.error(f"خطأ فحص '{slug}': {e}")
+        log.error(f"خطأ غير متوقع بمعالجة '{slug}': {e}")
     finally:
         checking.discard(slug)
 
 
+# ---------------------------------------------------------------------------
+# الاتصال بـ OpenSea Stream
+# ---------------------------------------------------------------------------
+
 async def listen_opensea():
     msg_ref = 0
+    notified: set[str] = set()
+    known_external: set[str] = set()
     checking: set[str] = set()
-    already_reported: set[str] = set()
 
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info("متصل بـ OpenSea Stream (وضع الرصد فقط)...")
+                log.info("متصل بـ OpenSea Stream — النظام يراقب ويشتري تلقائيًا.")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -187,11 +278,11 @@ async def listen_opensea():
                         continue
 
                     slug = (payload.get("collection", {}) or {}).get("slug", "")
-                    if not slug or slug in checking or slug in already_reported:
+                    if not slug or slug in notified or slug in known_external or slug in checking:
                         continue
 
                     checking.add(slug)
-                    asyncio.create_task(inspect_and_report(slug, checking, already_reported))
+                    asyncio.create_task(evaluate_and_buy(slug, notified, known_external, checking))
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
             log.warning(f"انقطع الاتصال ({e}). إعادة الاتصال خلال 3 ثوانٍ...")
@@ -202,9 +293,26 @@ async def listen_opensea():
 
 
 async def run():
-    enqueue_message("✅ وضع الرصد اشتغل — بينتظر أول مينت يبدأ اليوم لإرسال بياناته الخام.")
+    enqueue_message("✅ نظام الشراء التلقائي اشتغل الآن ويراقب Robinhood Chain.")
     await asyncio.gather(listen_opensea(), telegram_sender())
 
 
+def main():
+    backoff = 2
+    while True:
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            log.info("تم الإيقاف يدويًا.")
+            break
+        except Exception as e:
+            log.critical(f"توقف غير متوقع: {e}. إعادة التشغيل خلال {backoff} ثانية...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+        else:
+            break
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    main()
