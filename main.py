@@ -1,6 +1,7 @@
 """
-النظام الكامل: اكتشاف مينت مجاني بدأ اليوم على Robinhood Chain،
-التحقق من كل الضوابط عبر buyer.py، تنفيذ الشراء، وإرسال إشعار تيليجرام.
+النظام الكامل: مراقبة Robinhood Chain + Ethereum Mainnet بالتوازي،
+شراء تلقائي للمينتات المجانية اللي بدأت اليوم، مع إعادة محاولة
+تلقائية لو الغاز كان مرتفع لحظة الاكتشاف (كل 10 ثواني لمدة دقيقتين).
 """
 
 import asyncio
@@ -21,23 +22,26 @@ load_dotenv()
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
 PRIVATE_KEY = os.environ["PRIVATE_KEY"]
 WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
+ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
+ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
+
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
-RPC_URL = f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-TARGET_CHAIN = "robinhood"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.01  # أقل من هذا = "مجاني عمليًا"
+FREE_PRICE_THRESHOLD_USD = 0.01
+
+RETRY_INTERVAL_SECONDS = 10
+RETRY_DURATION_SECONDS = 120
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,8 +50,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto-buyer")
 
-w3 = get_web3(RPC_URL)
-buy_lock = asyncio.Lock()  # يمنع تضارب nonce لو اكتشف أكتر من مينت بنفس اللحظة
+# ---------------------------------------------------------------------------
+# إعدادات كل شبكة — لكل شبكة RPC مستقل وحد غاز مستقل
+# ---------------------------------------------------------------------------
+
+CHAIN_CONFIGS = {
+    "robinhood": {
+        "stream_chain_name": "robinhood",
+        "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
+        "max_gas_fee_usd": 0.05,
+    },
+    "ethereum": {
+        "stream_chain_name": "ethereum",
+        "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ETHEREUM}",
+        "max_gas_fee_usd": 0.50,
+    },
+}
+
+# نبني اتصال Web3 واحد لكل شبكة، جاهز بالذاكرة
+W3_INSTANCES = {key: get_web3(cfg["rpc_url"]) for key, cfg in CHAIN_CONFIGS.items()}
+
+# خريطة عكسية: اسم الشبكة كما يظهر بـ Stream API -> مفتاح الشبكة عندنا
+STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
+
+buy_lock = asyncio.Lock()
 
 _eth_price_cache = {"value": None, "ts": 0}
 
@@ -139,22 +165,22 @@ async def telegram_sender():
 
 REASON_MESSAGES = {
     "balance_too_low": "الرصيد بالمحفظة منخفض جدًا — توقف النظام عن الشراء",
-    "gas_too_high": "رسوم الغاز التقديرية تجاوزت الحد المسموح",
-    "gas_too_high_precise": "رسوم الغاز الفعلية (بعد التقدير الدقيق) تجاوزت الحد",
     "no_fee_recipient": "تعذر تحديد عنوان الرسوم من العقد",
     "simulation_failed": "محاكاة المعاملة فشلت — على الأغلب المينت غير متاح فعليًا",
     "insufficient_funds_for_total_cost": "الرصيد لا يكفي سعر المينت + الغاز معًا",
     "tx_error": "خطأ أثناء إرسال المعاملة",
+    "retry_timeout": "رسوم الغاز بقيت مرتفعة لمدة دقيقتين — تم التخلي عن المحاولة",
 }
 
 
-def build_result_message(detail: dict, result: dict, quantity: int | None) -> str:
+def build_result_message(detail: dict, result: dict, chain_key: str) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     url = detail.get("opensea_url", "")
+    chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
 
     if result["success"]:
         return (
-            f"✅ <b>تم الشراء بنجاح!</b>\n\n"
+            f"✅ <b>تم الشراء بنجاح!</b> ({chain_label})\n\n"
             f"المجموعة: <b>{name}</b>\n"
             f"الكمية: {result['quantity']}\n"
             f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
@@ -166,17 +192,90 @@ def build_result_message(detail: dict, result: dict, quantity: int | None) -> st
     extra = ""
     if result["reason"] == "balance_too_low":
         extra = f"\nالرصيد الحالي: ${result.get('balance_usd', 0):.4f}"
-    elif "gas_too_high" in result["reason"]:
-        extra = f"\nالرسوم المقدّرة: ${result.get('gas_fee_usd', 0):.4f}"
-
-    return f"⏭️ <b>تم تجاهل الشراء</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason_text}{extra}"
+    return f"⏭️ <b>تم تجاهل الشراء</b> ({chain_label})\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason_text}{extra}"
 
 
 # ---------------------------------------------------------------------------
-# منطق التحقق والشراء
+# قائمة إعادة المحاولة (لحالة الغاز المرتفع فقط)
 # ---------------------------------------------------------------------------
 
-async def evaluate_and_buy(slug: str, notified: set, known_external: set, checking: set):
+pending_retries: dict[str, dict] = {}  # slug -> {"chain_key":..., "deadline":..., "detail":...}
+
+
+async def retry_loop():
+    while True:
+        await asyncio.sleep(RETRY_INTERVAL_SECONDS)
+        if not pending_retries:
+            continue
+
+        for slug in list(pending_retries.keys()):
+            entry = pending_retries.get(slug)
+            if not entry:
+                continue
+
+            chain_key = entry["chain_key"]
+
+            # إعادة جلب بيانات الدروب (الكمية المتبقية ممكن تكون تغيرت)
+            found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
+            if not found or not fresh_detail or not fresh_detail.get("is_minting"):
+                pending_retries.pop(slug, None)
+                continue
+
+            stage = fresh_detail.get("active_stage")
+            if not stage:
+                pending_retries.pop(slug, None)
+                continue
+
+            max_supply = int(fresh_detail.get("max_supply") or 0)
+            total_supply = int(fresh_detail.get("total_supply") or 0)
+            remaining = max_supply - total_supply
+            if remaining <= 0:
+                pending_retries.pop(slug, None)
+                continue
+
+            price_wei = int(stage.get("price", "0"))
+            max_per_wallet_raw = stage.get("max_per_wallet")
+            max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
+            contract_address = fresh_detail.get("contract_address")
+
+            eth_price_usd = get_eth_price_usd()
+            w3 = W3_INSTANCES[chain_key]
+            max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
+
+            async with buy_lock:
+                result = await asyncio.to_thread(
+                    attempt_purchase,
+                    w3, PRIVATE_KEY, WALLET_ADDRESS,
+                    contract_address, price_wei, max_per_wallet, remaining,
+                    eth_price_usd, max_gas_fee_usd,
+                )
+
+            if result["success"]:
+                pending_retries.pop(slug, None)
+                enqueue_message(build_result_message(fresh_detail, result, chain_key))
+                log.info(f"✅ '{slug}': نجحت إعادة المحاولة بعد انخفاض الغاز.")
+                continue
+
+            if result["reason"] != "gas_too_high":
+                pending_retries.pop(slug, None)
+                enqueue_message(build_result_message(fresh_detail, result, chain_key))
+                continue
+
+            if time.time() > entry["deadline"]:
+                pending_retries.pop(slug, None)
+                enqueue_message(
+                    build_result_message(
+                        fresh_detail, {"success": False, "reason": "retry_timeout"}, chain_key
+                    )
+                )
+                log.info(f"⏱️ '{slug}': انتهت مهلة إعادة المحاولة (دقيقتين) — تم التخلي.")
+
+
+# ---------------------------------------------------------------------------
+# منطق التحقق والشراء الأولي
+# ---------------------------------------------------------------------------
+
+async def evaluate_and_buy(slug: str, chain_key: str, notified: set, known_external: set, checking: set):
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail:
@@ -216,16 +315,35 @@ async def evaluate_and_buy(slug: str, notified: set, known_external: set, checki
         max_per_wallet_raw = stage.get("max_per_wallet")
         max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
 
-        notified.add(slug)  # نمنع محاولات مكررة على نفس المجموعة حتى لو فشل الشراء
+        notified.add(slug)
+
+        w3 = W3_INSTANCES[chain_key]
+        max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
 
         async with buy_lock:
             result = await asyncio.to_thread(
                 attempt_purchase,
                 w3, PRIVATE_KEY, WALLET_ADDRESS,
-                contract_address, price_wei, max_per_wallet, remaining, eth_price_usd,
+                contract_address, price_wei, max_per_wallet, remaining,
+                eth_price_usd, max_gas_fee_usd,
             )
 
-        enqueue_message(build_result_message(detail, result, result.get("quantity")))
+        if not result["success"] and result["reason"] == "gas_too_high":
+            pending_retries[slug] = {
+                "chain_key": chain_key,
+                "deadline": time.time() + RETRY_DURATION_SECONDS,
+                "detail": detail,
+            }
+            enqueue_message(
+                f"⏳ <b>تأجيل شراء مؤقت</b>\n\n"
+                f"المجموعة: <b>{detail.get('collection_name', slug)}</b>\n"
+                f"السبب: رسوم الغاز مرتفعة حاليًا — بيعيد المحاولة كل 10 ثواني لمدة دقيقتين."
+            )
+            log.info(f"⏳ '{slug}': غاز مرتفع — أُضيف لقائمة إعادة المحاولة.")
+            checking.discard(slug)
+            return
+
+        enqueue_message(build_result_message(detail, result, chain_key))
         log.info(f"{'✅' if result['success'] else '⏭️'} '{slug}': {result}")
 
     except Exception as e:
@@ -235,7 +353,7 @@ async def evaluate_and_buy(slug: str, notified: set, known_external: set, checki
 
 
 # ---------------------------------------------------------------------------
-# الاتصال بـ OpenSea Stream
+# الاتصال بـ OpenSea Stream — يراقب كل الشبكات المفعّلة بـ CHAIN_CONFIGS
 # ---------------------------------------------------------------------------
 
 async def listen_opensea():
@@ -247,7 +365,7 @@ async def listen_opensea():
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info("متصل بـ OpenSea Stream — النظام يراقب ويشتري تلقائيًا.")
+                log.info(f"متصل بـ OpenSea Stream — يراقب: {list(CHAIN_CONFIGS.keys())}")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -280,9 +398,11 @@ async def listen_opensea():
 
                     payload = (payload_wrapper or {}).get("payload") or {}
                     item = payload.get("item", {}) or {}
-                    chain = (item.get("chain", {}) or {}).get("name", "")
-                    if chain != TARGET_CHAIN:
-                        continue
+                    stream_chain_name = (item.get("chain", {}) or {}).get("name", "")
+
+                    chain_key = STREAM_NAME_TO_CHAIN_KEY.get(stream_chain_name)
+                    if chain_key is None:
+                        continue  # شبكة مو مفعّلة عندنا
 
                     from_address = ((payload.get("from_account") or {}).get("address", "") or "").lower()
                     if from_address != ZERO_ADDRESS:
@@ -293,7 +413,7 @@ async def listen_opensea():
                         continue
 
                     checking.add(slug)
-                    asyncio.create_task(evaluate_and_buy(slug, notified, known_external, checking))
+                    asyncio.create_task(evaluate_and_buy(slug, chain_key, notified, known_external, checking))
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
             log.warning(f"انقطع الاتصال ({e}). إعادة الاتصال خلال 3 ثوانٍ...")
@@ -305,13 +425,15 @@ async def listen_opensea():
 
 async def run():
     if not BOT_ENABLED:
-        log.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان). لن يشتري أي شي.")
+        log.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان).")
         enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false) — ما رح يشتري لين تفعّله.")
         await telegram_sender()
         return
 
-    enqueue_message("✅ نظام الشراء التلقائي اشتغل الآن ويراقب Robinhood Chain.")
-    await asyncio.gather(listen_opensea(), telegram_sender())
+    enqueue_message(
+        f"✅ نظام الشراء التلقائي اشتغل الآن — يراقب: {', '.join(CHAIN_CONFIGS.keys())}"
+    )
+    await asyncio.gather(listen_opensea(), retry_loop(), telegram_sender())
 
 
 def main():
