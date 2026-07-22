@@ -31,6 +31,24 @@ SEADROP_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "name": "getPublicDrop",
+        "outputs": [{
+            "components": [
+                {"name": "mintPrice", "type": "uint80"},
+                {"name": "startTime", "type": "uint48"},
+                {"name": "endTime", "type": "uint48"},
+                {"name": "maxTotalMintableByWallet", "type": "uint16"},
+                {"name": "feeBps", "type": "uint16"},
+                {"name": "restrictFeeRecipients", "type": "bool"},
+            ],
+            "name": "",
+            "type": "tuple",
+        }],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 MIN_BALANCE_RESERVE_USD = 0.30
@@ -85,6 +103,17 @@ def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
     else:
         qty = LIMITED_BUY_QTY
     return max(1, min(qty, remaining_supply))
+
+def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
+    try:
+        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        public_drop = seadrop.functions.getPublicDrop(
+            Web3.to_checksum_address(nft_contract)
+        ).call()
+        return int(public_drop[0])  # mintPrice هو أول عنصر بالـ tuple
+    except Exception as e:
+        log.warning(f"[سعر on-chain] تعذر القراءة، سنعتمد بيانات OpenSea: {e}")
+        return None
 
 
 def attempt_purchase(
