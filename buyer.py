@@ -1,6 +1,7 @@
 """
 محرك الشراء التلقائي عبر عقد SeaDrop — يدعم أكتر من شبكة (Robinhood + Ethereum).
 كل الضوابط الأمنية مركزة هنا بدالة واحدة.
+يدعم تقليص الكمية تدريجيًا (10 -> 5 -> 2 -> 1) لو رسوم الغاز مرتفعة على الكمية الكاملة.
 """
 
 import logging
@@ -104,6 +105,7 @@ def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
         qty = LIMITED_BUY_QTY
     return max(1, min(qty, remaining_supply))
 
+
 def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
@@ -114,6 +116,20 @@ def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
     except Exception as e:
         log.warning(f"[سعر on-chain] تعذر القراءة، سنعتمد بيانات OpenSea: {e}")
         return None
+
+
+def build_quantity_candidates(initial_qty: int) -> list[int]:
+    """
+    يبني قائمة كميات تنازلية للتجربة: الكمية الكاملة، ثم نصفها، ثم نصف النصف... لحد 1.
+    مثال: 10 -> [10, 5, 2, 1]
+    """
+    candidates = []
+    q = initial_qty
+    while q > 1:
+        candidates.append(q)
+        q = q // 2
+    candidates.append(1)
+    return candidates
 
 
 def attempt_purchase(
@@ -129,6 +145,7 @@ def attempt_purchase(
 ) -> dict:
     """
     max_gas_fee_usd يُمرَّر من main.py حسب الشبكة (كل شبكة لها حدها الخاص).
+    يجرب كميات متناقصة (10 -> 5 -> 2 -> 1) لحد ما يلقى كمية تنجح ضمن حد الغاز.
     """
 
     balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
@@ -136,62 +153,74 @@ def attempt_purchase(
         log.warning(f"[توقف] الرصيد ${balance_usd:.4f} أقل من الحد ${MIN_BALANCE_RESERVE_USD}.")
         return {"success": False, "reason": "balance_too_low", "balance_usd": balance_usd}
 
-    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
-    if gas_fee_usd > max_gas_fee_usd:
-        log.info(f"[تأجيل] رسوم الغاز ${gas_fee_usd:.4f} > الحد ${max_gas_fee_usd}.")
-        return {"success": False, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
-
     fee_recipient = get_fee_recipient(w3, nft_contract)
     if not fee_recipient:
         return {"success": False, "reason": "no_fee_recipient"}
 
-    quantity = decide_quantity(max_per_wallet, remaining_supply)
-    total_value = price_wei_per_token * quantity
+    initial_quantity = decide_quantity(max_per_wallet, remaining_supply)
+    candidates = build_quantity_candidates(initial_quantity)
 
-    try:
-        contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
-        tx = contract.functions.mintPublic(
-            Web3.to_checksum_address(nft_contract),
-            Web3.to_checksum_address(fee_recipient),
-            Web3.to_checksum_address(ZERO_ADDRESS),
-            quantity,
-        ).build_transaction({
-            "from": Web3.to_checksum_address(wallet_address),
-            "value": total_value,
-            "nonce": w3.eth.get_transaction_count(wallet_address, "pending"),
-            "chainId": w3.eth.chain_id,
-        })
+    last_gas_fee_usd = None
+
+    for quantity in candidates:
+        total_value = price_wei_per_token * quantity
 
         try:
-            estimated_gas = w3.eth.estimate_gas(tx)
-            tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
+            contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+            tx = contract.functions.mintPublic(
+                Web3.to_checksum_address(nft_contract),
+                Web3.to_checksum_address(fee_recipient),
+                Web3.to_checksum_address(ZERO_ADDRESS),
+                quantity,
+            ).build_transaction({
+                "from": Web3.to_checksum_address(wallet_address),
+                "value": total_value,
+                "nonce": w3.eth.get_transaction_count(wallet_address, "pending"),
+                "chainId": w3.eth.chain_id,
+            })
+
+            try:
+                estimated_gas = w3.eth.estimate_gas(tx)
+                tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
+            except Exception as e:
+                log.error(f"[إلغاء] فشل estimate_gas بكمية {quantity}: {e}")
+                continue  # المحاكاة فشلت لهذي الكمية — جرب الأصغر
+
+            actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
+            last_gas_fee_usd = actual_gas_fee_usd
+
+            if actual_gas_fee_usd > max_gas_fee_usd:
+                log.info(
+                    f"[تقليص] كمية {quantity}: رسوم ${actual_gas_fee_usd:.4f} > الحد ${max_gas_fee_usd} "
+                    f"— تجربة كمية أصغر..."
+                )
+                continue  # جرب الكمية الأصغر التالية بالقائمة
+
+            total_cost_wei = total_value + (tx["gas"] * w3.eth.gas_price)
+            wallet_balance_wei = w3.eth.get_balance(Web3.to_checksum_address(wallet_address))
+            if wallet_balance_wei < total_cost_wei:
+                log.warning(f"[إلغاء] الرصيد لا يكفي لكمية {quantity} (سعر + غاز).")
+                continue  # جرب كمية أصغر، ممكن تكفي
+
+            signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+
+            log.info(f"[شراء ناجح] {tx_hash.hex()} — كمية نهائية: {quantity} (الأصلية: {initial_quantity})")
+            return {
+                "success": True,
+                "tx_hash": tx_hash.hex(),
+                "quantity": quantity,
+                "gas_fee_usd": actual_gas_fee_usd,
+                "total_value_wei": total_value,
+            }
+
         except Exception as e:
-            log.error(f"[إلغاء] فشل estimate_gas — المعاملة على الأغلب رح ترفض: {e}")
-            return {"success": False, "reason": "simulation_failed", "error": str(e)}
+            log.error(f"[خطأ إرسال] بكمية {quantity}: {e}")
+            continue
 
-        actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
-        if actual_gas_fee_usd > max_gas_fee_usd:
-            log.info(f"[تأجيل] التكلفة الفعلية ${actual_gas_fee_usd:.4f} > الحد بعد التقدير الدقيق.")
-            return {"success": False, "reason": "gas_too_high", "gas_fee_usd": actual_gas_fee_usd}
-
-        total_cost_wei = total_value + (tx["gas"] * w3.eth.gas_price)
-        wallet_balance_wei = w3.eth.get_balance(Web3.to_checksum_address(wallet_address))
-        if wallet_balance_wei < total_cost_wei:
-            log.warning("[إلغاء] الرصيد لا يكفي لتغطية سعر المينت + الغاز معًا.")
-            return {"success": False, "reason": "insufficient_funds_for_total_cost"}
-
-        signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-
-        log.info(f"[شراء ناجح] {tx_hash.hex()} — كمية: {quantity}")
-        return {
-            "success": True,
-            "tx_hash": tx_hash.hex(),
-            "quantity": quantity,
-            "gas_fee_usd": actual_gas_fee_usd,
-            "total_value_wei": total_value,
-        }
-
-    except Exception as e:
-        log.error(f"[خطأ إرسال] {e}")
-        return {"success": False, "reason": "tx_error", "error": str(e)}
+    # جربنا كل الكميات ولا وحدة نجحت
+    return {
+        "success": False,
+        "reason": "gas_too_high",
+        "gas_fee_usd": last_gas_fee_usd if last_gas_fee_usd is not None else float("inf"),
+    }
