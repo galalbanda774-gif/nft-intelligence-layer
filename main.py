@@ -294,7 +294,7 @@ async def watch_loop():
                 found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
                     watchlist.pop(slug, None)
-                    enqueue_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
+                    log.info(f"🔕 '{slug}': المينت لم يعد نشطًا — إزالة من المراقبة بصمت (بدون إشعار).")
                     continue
 
                 stage = fresh_detail.get("active_stage")
