@@ -221,4 +221,4 @@ def attempt_purchase(
         "success": False,
         "reason": "gas_too_high",
         "gas_fee_usd": last_gas_fee_usd if last_gas_fee_usd is not None else float("inf"),
-                }
+    }
