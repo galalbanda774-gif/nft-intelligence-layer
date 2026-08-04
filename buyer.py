@@ -1,7 +1,7 @@
 """
 محرك الشراء التلقائي عبر عقد SeaDrop — يدعم أكتر من شبكة (Robinhood + Ethereum).
-كل الضوابط الأمنية مركزة هنا بدالة واحدة.
-يدعم تقليص الكمية تدريجيًا (10 -> 5 -> 2 -> 1) لو رسوم الغاز مرتفعة على الكمية الكاملة.
+يجرب كميات متناقصة لو الغاز مرتفع، ويتحقق من نجاح المعاملة فعليًا على الشبكة
+(مو بس إرسالها) قبل ما يعلن النجاح.
 """
 
 import logging
@@ -56,6 +56,7 @@ MIN_BALANCE_RESERVE_USD = 0.30
 FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 5
 GAS_LIMIT_SAFETY_MARGIN = 1.2
+RECEIPT_TIMEOUT_SECONDS = 60
 
 
 def get_web3(rpc_url: str) -> Web3:
@@ -69,16 +70,6 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
     except Exception as e:
         log.error(f"[الرصيد] تعذر القراءة: {e}")
         return 0.0
-
-
-def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
-    try:
-        gas_price_wei = w3.eth.gas_price
-        fee_eth = (gas_price_wei * gas_units) / 1e18
-        return fee_eth * eth_price_usd
-    except Exception as e:
-        log.warning(f"[الغاز] تعذر التقدير: {e}")
-        return float("inf")
 
 
 def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
@@ -112,17 +103,13 @@ def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
         public_drop = seadrop.functions.getPublicDrop(
             Web3.to_checksum_address(nft_contract)
         ).call()
-        return int(public_drop[0])  # mintPrice هو أول عنصر بالـ tuple
+        return int(public_drop[0])
     except Exception as e:
         log.warning(f"[سعر on-chain] تعذر القراءة، سنعتمد بيانات OpenSea: {e}")
         return None
 
 
 def build_quantity_candidates(initial_qty: int) -> list[int]:
-    """
-    يبني قائمة كميات تنازلية للتجربة: الكمية الكاملة، ثم نصفها، ثم نصف النصف... لحد 1.
-    مثال: 10 -> [10, 5, 2, 1]
-    """
     candidates = []
     q = initial_qty
     while q > 1:
@@ -143,11 +130,6 @@ def attempt_purchase(
     eth_price_usd: float,
     max_gas_fee_usd: float,
 ) -> dict:
-    """
-    max_gas_fee_usd يُمرَّر من main.py حسب الشبكة (كل شبكة لها حدها الخاص).
-    يجرب كميات متناقصة (10 -> 5 -> 2 -> 1) لحد ما يلقى كمية تنجح ضمن حد الغاز.
-    """
-
     balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         log.warning(f"[توقف] الرصيد ${balance_usd:.4f} أقل من الحد ${MIN_BALANCE_RESERVE_USD}.")
@@ -184,7 +166,7 @@ def attempt_purchase(
                 tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
             except Exception as e:
                 log.error(f"[إلغاء] فشل estimate_gas بكمية {quantity}: {e}")
-                continue  # المحاكاة فشلت لهذي الكمية — جرب الأصغر
+                continue
 
             actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
             last_gas_fee_usd = actual_gas_fee_usd
@@ -194,18 +176,35 @@ def attempt_purchase(
                     f"[تقليص] كمية {quantity}: رسوم ${actual_gas_fee_usd:.4f} > الحد ${max_gas_fee_usd} "
                     f"— تجربة كمية أصغر..."
                 )
-                continue  # جرب الكمية الأصغر التالية بالقائمة
+                continue
 
             total_cost_wei = total_value + (tx["gas"] * w3.eth.gas_price)
             wallet_balance_wei = w3.eth.get_balance(Web3.to_checksum_address(wallet_address))
             if wallet_balance_wei < total_cost_wei:
                 log.warning(f"[إلغاء] الرصيد لا يكفي لكمية {quantity} (سعر + غاز).")
-                continue  # جرب كمية أصغر، ممكن تكفي
+                continue
 
             signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            log.info(f"[إرسال] {tx_hash.hex()} — بانتظار تأكيد التنفيذ الفعلي...")
 
-            log.info(f"[شراء ناجح] {tx_hash.hex()} — كمية نهائية: {quantity} (الأصلية: {initial_quantity})")
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS)
+            except Exception as e:
+                log.warning(f"[غير مؤكد] {tx_hash.hex()} لم يتأكد خلال {RECEIPT_TIMEOUT_SECONDS} ثانية: {e}")
+                return {
+                    "success": False, "reason": "tx_unconfirmed",
+                    "tx_hash": tx_hash.hex(), "gas_fee_usd": actual_gas_fee_usd,
+                }
+
+            if receipt.status != 1:
+                log.warning(f"[فشل فعلي] {tx_hash.hex()} انعكست على الشبكة (نفدت الكمية على الأغلب).")
+                return {
+                    "success": False, "reason": "tx_reverted",
+                    "tx_hash": tx_hash.hex(), "gas_fee_usd": actual_gas_fee_usd,
+                }
+
+            log.info(f"[شراء مؤكد] {tx_hash.hex()} — كمية نهائية: {quantity} (الأصلية: {initial_quantity})")
             return {
                 "success": True,
                 "tx_hash": tx_hash.hex(),
@@ -218,9 +217,8 @@ def attempt_purchase(
             log.error(f"[خطأ إرسال] بكمية {quantity}: {e}")
             continue
 
-    # جربنا كل الكميات ولا وحدة نجحت
     return {
         "success": False,
         "reason": "gas_too_high",
         "gas_fee_usd": last_gas_fee_usd if last_gas_fee_usd is not None else float("inf"),
-    }
+                }
