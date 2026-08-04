@@ -30,8 +30,8 @@ BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
 ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
 
-_wallet_addresses = [a.strip() for a in os.environ["WALLET_ADDRESSES"].split(",") if a.strip()]
-_private_keys = [k.strip() for k in os.environ["PRIVATE_KEYS"].split(",") if k.strip()]
+_wallet_addresses = [a.strip() for a in os.environ["WALLET_ADDRESS"].split(",") if a.strip()]
+_private_keys = [k.strip() for k in os.environ["PRIVATE_KEY"].split(",") if k.strip()]
 
 if len(_wallet_addresses) != len(_private_keys):
     raise ValueError(
