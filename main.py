@@ -1,12 +1,10 @@
 """
-النظام الكامل — نسخة المراقبة الدائمة:
+النظام الكامل — محافظ متعددة + رسالة مجمّعة واحدة لكل مينت:
   - يكتشف مينتات بدأت اليوم على Robinhood + Ethereum
-  - أي مينت (حتى لو مدفوع حاليًا أو الغاز مرتفع) يُضاف لقائمة مراقبة دائمة
-  - يعيد الفحص كل 15 ثانية (سعر من العقد مباشرة + غاز + كمية متبقية)
-  - يشتري فور توفر الشرط، ويتوقف عن المراقبة فقط عند: نجاح الشراء،
-    انتهاء وقت المرحلة، أو نفاد الكمية
-  - لا يشتري نفس المجموعة مرتين أبدًا
-  - إشعارات تيليجرام محصورة فقط بـ: شراء ناجح ✅ / انتهاء الفرصة نهائيًا ❌ / تحذير رصيد منخفض 🔴
+  - كل محفظة تحاول تشتري نسختها الخاصة من نفس المينت، بشكل مستقل تمامًا
+  - نتائج كل المحافظ اللي نجحت بنفس الجولة تُجمع برسالة تيليجرام واحدة
+  - أي مينت لسا معلّق (غاز مرتفع/مدفوع) يُضاف لمراقبة دائمة لكل محفظة لسا ما اشترت
+  - كل محفظة لا تشتري نفس المجموعة مرتين أبدًا
 """
 
 import asyncio
@@ -27,12 +25,20 @@ load_dotenv()
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-PRIVATE_KEY = os.environ["PRIVATE_KEY"]
-WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
 ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
 ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
+
+_wallet_addresses = [a.strip() for a in os.environ["WALLET_ADDRESSES"].split(",") if a.strip()]
+_private_keys = [k.strip() for k in os.environ["PRIVATE_KEYS"].split(",") if k.strip()]
+
+if len(_wallet_addresses) != len(_private_keys):
+    raise ValueError(
+        f"عدد WALLET_ADDRESSES ({len(_wallet_addresses)}) لا يطابق عدد PRIVATE_KEYS ({len(_private_keys)})"
+    )
+
+WALLETS = [{"address": a, "private_key": k} for a, k in zip(_wallet_addresses, _private_keys)]
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -71,8 +77,8 @@ STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_
 
 buy_lock = asyncio.Lock()
 
-notified: set[str] = set()
-watchlist: dict[str, dict] = {}
+notified: set[tuple[str, str]] = set()  # (wallet_address, slug)
+watchlist: dict[str, dict] = {}  # slug -> {"chain_key":, "detail":, "pending_wallets": set}
 in_flight: set[str] = set()
 
 _eth_price_cache = {"value": None, "ts": 0}
@@ -162,18 +168,25 @@ async def telegram_sender():
         await asyncio.sleep(1.05)
 
 
-def build_result_message(detail: dict, result: dict, chain_key: str) -> str:
+def short_addr(addr: str) -> str:
+    return f"{addr[:6]}...{addr[-4:]}"
+
+
+def build_consolidated_success_message(detail: dict, chain_key: str, successes: list[tuple[str, dict]]) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     url = detail.get("opensea_url", "")
     chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
-    return (
-        f"✅ <b>تم الشراء بنجاح!</b> ({chain_label})\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"الكمية: {result['quantity']}\n"
-        f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
-        f"معاملة: {result['tx_hash']}\n"
-        f"🔗 {url}"
-    )
+
+    lines = [f"✅ <b>تم الشراء بنجاح!</b> ({chain_label})", "", f"المجموعة: <b>{name}</b>"]
+    for wallet_address, result in successes:
+        lines.append("")
+        lines.append(f"👛 المحفظة: <code>{short_addr(wallet_address)}</code>")
+        lines.append(f"الكمية: {result['quantity']}")
+        lines.append(f"رسوم الغاز: ${result['gas_fee_usd']:.4f}")
+        lines.append(f"معاملة: {result['tx_hash']}")
+    lines.append("")
+    lines.append(f"🔗 {url}")
+    return "\n".join(lines)
 
 
 def build_gaveup_message(detail: dict, reason: str) -> str:
@@ -181,7 +194,20 @@ def build_gaveup_message(detail: dict, reason: str) -> str:
     return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
 
 
-async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
+def build_reverted_message(detail: dict, chain_key: str, failures: list[tuple[str, dict]]) -> str:
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
+    lines = [f"⚠️ <b>معاملة فشلت فعليًا (استهلكت غاز)</b> ({chain_label})", "", f"المجموعة: <b>{name}</b>"]
+    for wallet_address, result in failures:
+        lines.append("")
+        lines.append(f"👛 المحفظة: <code>{short_addr(wallet_address)}</code>")
+        lines.append(f"رسوم مدفوعة: ${result.get('gas_fee_usd', 0):.4f}")
+        lines.append(f"معاملة: {result.get('tx_hash', '')}")
+        lines.append("السبب: على الأغلب نفدت الكمية قبل تأكيد معاملتك")
+    return "\n".join(lines)
+
+
+async def try_buy_now(slug: str, chain_key: str, detail: dict, wallet: dict) -> dict | None:
     stage = detail.get("active_stage")
     if not stage:
         return None
@@ -209,23 +235,24 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
     max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
     max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
 
+    key = (wallet["address"], slug)
     async with buy_lock:
-        if slug in notified:
+        if key in notified:
             return {"success": False, "reason": "already_bought"}
         result = await asyncio.to_thread(
             attempt_purchase,
-            w3, PRIVATE_KEY, WALLET_ADDRESS,
+            w3, wallet["private_key"], wallet["address"],
             contract_address, price_wei, max_per_wallet, remaining,
             eth_price_usd, max_gas_fee_usd,
         )
         if result["success"]:
-            notified.add(slug)
+            notified.add(key)
 
     return result
 
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    if slug in notified or slug in watchlist or slug in in_flight:
+    if slug in watchlist or slug in in_flight:
         return
     in_flight.add(slug)
     try:
@@ -237,36 +264,56 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        result = await try_buy_now(slug, chain_key, detail)
+        pending_wallets: set[str] = set()
+        successes: list[tuple[str, dict]] = []
+        reverted: list[tuple[str, dict]] = []
+        sold_out_hit = False
 
-        if result is None:
-            watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة (مدفوع حاليًا).")
-            return
+        for wallet in WALLETS:
+            if (wallet["address"], slug) in notified:
+                continue
 
-        if result["success"]:
-            enqueue_message(build_result_message(detail, result, chain_key))
-            log.info(f"✅ '{slug}': تم الشراء عند أول اكتشاف.")
-            return
+            result = await try_buy_now(slug, chain_key, detail, wallet)
 
-        if result["reason"] == "gas_too_high":
-            watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة (غاز مرتفع).")
-            return
+            if result is None:
+                pending_wallets.add(wallet["address"])
+                continue
 
-        if result["reason"] == "sold_out":
-            return
+            if result["success"]:
+                successes.append((wallet["address"], result))
+                continue
 
-        if result["reason"] == "balance_too_low":
-            enqueue_message(
-                f"🔴 <b>تنبيه: الرصيد منخفض جدًا!</b>\n\nالرصيد الحالي: ${result.get('balance_usd', 0):.4f}\n"
-                f"النظام قد يفوت فرص شراء حتى تعيد التعبئة."
-            )
-            watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            return
+            if result["reason"] == "sold_out":
+                sold_out_hit = True
+                pending_wallets.clear()
+                break
 
-        watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-        log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة (سبب: {result['reason']}).")
+            if result["reason"] == "tx_reverted":
+                reverted.append((wallet["address"], result))
+                continue
+
+            if result["reason"] == "balance_too_low":
+                enqueue_message(
+                    f"🔴 <b>تنبيه: رصيد منخفض!</b>\n\nالمحفظة: <code>{short_addr(wallet['address'])}</code>\n"
+                    f"الرصيد الحالي: ${result.get('balance_usd', 0):.4f}"
+                )
+                continue
+
+            pending_wallets.add(wallet["address"])
+
+        if successes:
+            enqueue_message(build_consolidated_success_message(detail, chain_key, successes))
+            log.info(f"✅ '{slug}': نجح الشراء لـ {len(successes)} محفظة عند أول اكتشاف.")
+
+        if reverted:
+            enqueue_message(build_reverted_message(detail, chain_key, reverted))
+
+        if sold_out_hit and not successes:
+            return  # ما فيه داعي نراقب مجموعة خلصت كميتها
+
+        if pending_wallets:
+            watchlist[slug] = {"chain_key": chain_key, "detail": detail, "pending_wallets": pending_wallets}
+            log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة لـ {len(pending_wallets)} محفظة.")
 
     except Exception as e:
         log.error(f"خطأ غير متوقع بتقييم '{slug}': {e}")
@@ -281,7 +328,7 @@ async def watch_loop():
             continue
 
         for slug in list(watchlist.keys()):
-            if slug in in_flight or slug in notified:
+            if slug in in_flight:
                 continue
             entry = watchlist.get(slug)
             if not entry:
@@ -300,7 +347,8 @@ async def watch_loop():
                 stage = fresh_detail.get("active_stage")
                 if not stage:
                     if fresh_detail.get("next_stage"):
-                        watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                        entry["detail"] = fresh_detail
+                        watchlist[slug] = entry
                         continue
                     watchlist.pop(slug, None)
                     enqueue_message(build_gaveup_message(fresh_detail, "لا توجد مرحلة نشطة أو قادمة."))
@@ -312,24 +360,57 @@ async def watch_loop():
                     log.info(f"⏱️ '{slug}': انتهى وقت المرحلة — تم إيقاف المراقبة.")
                     continue
 
-                result = await try_buy_now(slug, chain_key, fresh_detail)
+                still_pending: set[str] = set()
+                successes: list[tuple[str, dict]] = []
+                reverted: list[tuple[str, dict]] = []
+                sold_out_hit = False
 
-                if result is None:
-                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
-                    continue
+                for wallet_address in list(entry["pending_wallets"]):
+                    if (wallet_address, slug) in notified:
+                        continue
+                    wallet = next((w for w in WALLETS if w["address"] == wallet_address), None)
+                    if not wallet:
+                        continue
 
-                if result["success"]:
-                    watchlist.pop(slug, None)
-                    enqueue_message(build_result_message(fresh_detail, result, chain_key))
-                    log.info(f"✅ '{slug}': نجح الشراء أثناء المراقبة الدائمة.")
-                    continue
+                    result = await try_buy_now(slug, chain_key, fresh_detail, wallet)
 
-                if result["reason"] == "sold_out":
+                    if result is None:
+                        still_pending.add(wallet_address)
+                        continue
+
+                    if result["success"]:
+                        successes.append((wallet_address, result))
+                        continue
+
+                    if result["reason"] == "sold_out":
+                        sold_out_hit = True
+                        still_pending.clear()
+                        break
+
+                    if result["reason"] == "tx_reverted":
+                        reverted.append((wallet_address, result))
+                        continue
+
+                    still_pending.add(wallet_address)
+
+                if successes:
+                    enqueue_message(build_consolidated_success_message(fresh_detail, chain_key, successes))
+                    log.info(f"✅ '{slug}': نجح الشراء لـ {len(successes)} محفظة أثناء المراقبة.")
+
+                if reverted:
+                    enqueue_message(build_reverted_message(fresh_detail, chain_key, reverted))
+
+                if sold_out_hit:
                     watchlist.pop(slug, None)
                     enqueue_message(build_gaveup_message(fresh_detail, "نفدت الكمية قبل ما نشتري."))
                     continue
 
-                watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                if still_pending:
+                    entry["detail"] = fresh_detail
+                    entry["pending_wallets"] = still_pending
+                    watchlist[slug] = entry
+                else:
+                    watchlist.pop(slug, None)
 
             except Exception as e:
                 log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
@@ -342,7 +423,7 @@ async def listen_opensea():
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info(f"متصل بـ OpenSea Stream — يراقب: {list(CHAIN_CONFIGS.keys())}")
+                log.info(f"متصل بـ OpenSea Stream — يراقب: {list(CHAIN_CONFIGS.keys())} لـ {len(WALLETS)} محفظة.")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -406,7 +487,9 @@ async def run():
         await telegram_sender()
         return
 
-    enqueue_message(f"✅ نظام الشراء التلقائي (مراقبة دائمة) اشتغل — يراقب: {', '.join(CHAIN_CONFIGS.keys())}")
+    enqueue_message(
+        f"✅ نظام الشراء التلقائي (متعدد المحافظ) اشتغل — {len(WALLETS)} محفظة، يراقب: {', '.join(CHAIN_CONFIGS.keys())}"
+    )
     await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
 
 
